@@ -3,6 +3,7 @@ from __future__ import annotations
 import warnings
 from typing import TYPE_CHECKING, Any, Unpack
 
+from fouroversix import FourOverSixLinear, ModuleQuantizationConfig
 import torch
 from einops import rearrange
 from fla.layers.utils import pad_input, unpad_input
@@ -16,8 +17,6 @@ from fla.models.utils import FLAGenerationMixin
 from fla.modules import RMSNorm, RotaryEmbedding
 from fla.modules.activations import ACT2FN
 from fla.ops.utils.index import prepare_lens_from_mask
-from fouroversix import AdaptiveBlockScalingRule, QuantizeBackend
-from fouroversix.model import TrainableFP4Linear
 from torch import nn
 
 from .configuration_transformer import FP4TransformerConfig
@@ -41,7 +40,7 @@ except ImportError:
     from fla.models.modeling_layers import GradientCheckpointingLayer
 
 
-class AttentionWithFP4Projections(nn.Module):
+class AttentionWithQuantizedProjections(nn.Module):
 
     def __init__(
         self,
@@ -54,8 +53,7 @@ class AttentionWithFP4Projections(nn.Module):
         rope_theta: float | None = 10000.0,
         max_position_embeddings: int | None = None,
         layer_idx: int = None,
-        scale_rule: AdaptiveBlockScalingRule | None = None,
-        quantize_backend: QuantizeBackend | None = None,
+        module_config: ModuleQuantizationConfig | None = None,
     ):
         super().__init__()
 
@@ -81,33 +79,37 @@ class AttentionWithFP4Projections(nn.Module):
                 "Please install Flash Attention via `pip install flash-attn --no-build-isolation` first",
             )
 
-        linear_kwargs = {
-            "a_scale_rule": scale_rule,
-            "w_scale_rule": scale_rule,
-            "g_scale_rule": scale_rule,
-            "quantize_backend": quantize_backend,
-        }
-
-        self.q_proj = TrainableFP4Linear(
-            self.hidden_size,
-            self.hidden_size,
-            bias=self.qkv_bias,
-            **linear_kwargs,
+        self.q_proj = FourOverSixLinear(
+            nn.Linear(
+                self.hidden_size,
+                self.hidden_size,
+                bias=self.qkv_bias,
+            ),
+            module_config,
         )
-        self.k_proj = TrainableFP4Linear(
-            self.hidden_size,
-            self.kv_dim,
-            bias=self.qkv_bias,
-            **linear_kwargs,
+        self.k_proj = FourOverSixLinear(
+            nn.Linear(
+                self.hidden_size,
+                self.kv_dim,
+                bias=self.qkv_bias,
+            ),
+            module_config,
         )
-        self.v_proj = TrainableFP4Linear(
-            self.hidden_size,
-            self.kv_dim,
-            bias=self.qkv_bias,
-            **linear_kwargs,
+        self.v_proj = FourOverSixLinear(
+            nn.Linear(
+                self.hidden_size,
+                self.kv_dim,
+                bias=self.qkv_bias,
+            ),
+            module_config,
         )
-        self.o_proj = TrainableFP4Linear(
-            self.hidden_size, self.hidden_size, bias=False, **linear_kwargs,
+        self.o_proj = FourOverSixLinear(
+            nn.Linear(
+                self.hidden_size,
+                self.hidden_size,
+                bias=False,
+            ),
+            module_config,
         )
 
         if qk_norm:
@@ -135,13 +137,19 @@ class AttentionWithFP4Projections(nn.Module):
         batch_size, q_len, _ = hidden_states.size()
 
         q = rearrange(
-            self.q_proj(hidden_states), "... (h d) -> ... h d", d=self.head_dim,
+            self.q_proj(hidden_states),
+            "... (h d) -> ... h d",
+            d=self.head_dim,
         )
         k = rearrange(
-            self.k_proj(hidden_states), "... (h d) -> ... h d", d=self.head_dim,
+            self.k_proj(hidden_states),
+            "... (h d) -> ... h d",
+            d=self.head_dim,
         )
         v = rearrange(
-            self.v_proj(hidden_states), "... (h d) -> ... h d", d=self.head_dim,
+            self.v_proj(hidden_states),
+            "... (h d) -> ... h d",
+            d=self.head_dim,
         )
 
         if self.qk_norm:
@@ -192,7 +200,10 @@ class AttentionWithFP4Projections(nn.Module):
             if q.shape[1] == 1 and self.window_size is not None:
                 attention_mask = attention_mask[:, -self.window_size :]
             q, (k, v), indices_q, cu_seqlens, max_seq_lens = unpad_input(
-                q, (k, v), attention_mask, q_len,
+                q,
+                (k, v),
+                attention_mask,
+                q_len,
             )
             cu_seqlens_q, cu_seqlens_k = cu_seqlens
             max_seqlen_q, max_seqlen_k = max_seq_lens
@@ -243,7 +254,7 @@ class AttentionWithFP4Projections(nn.Module):
         return o, attentions, past_key_values
 
 
-class FP4GatedMLP(nn.Module):
+class QuantizedGatedMLP(nn.Module):
 
     def __init__(
         self,
@@ -252,13 +263,12 @@ class FP4GatedMLP(nn.Module):
         intermediate_size: int | None = None,
         hidden_act: str = "swish",
         fuse_swiglu: bool = True,
-        scale_rule: AdaptiveBlockScalingRule | None = None,
-        quantize_backend: QuantizeBackend | None = None,
-    ) -> FP4GatedMLP:
+        module_config: ModuleQuantizationConfig | None = None,
+    ) -> QuantizedGatedMLP:
         super().__init__()
 
         if fuse_swiglu:
-            raise ValueError("fuse_swiglu is not supported for FP4GatedMLP")
+            raise ValueError("fuse_swiglu is not supported for QuantizedGatedMLP")
 
         self.hidden_size = hidden_size
         # the final number of params is `hidden_ratio * hidden_size^2`
@@ -276,28 +286,29 @@ class FP4GatedMLP(nn.Module):
         if hidden_act != "swish":
             raise ValueError(f"Unsupported hidden_act: {hidden_act}")
 
-        linear_kwargs = {
-            "a_scale_rule": scale_rule,
-            "w_scale_rule": scale_rule,
-            "g_scale_rule": scale_rule,
-            "quantize_backend": quantize_backend,
-            "bias": False,
-        }
-
-        self.gate_proj = TrainableFP4Linear(
-            self.hidden_size,
-            self.intermediate_size,
-            **linear_kwargs,
+        self.gate_proj = FourOverSixLinear(
+            nn.Linear(
+                self.hidden_size,
+                self.intermediate_size,
+                bias=False,
+            ),
+            module_config,
         )
-        self.up_proj = TrainableFP4Linear(
-            self.hidden_size,
-            self.intermediate_size,
-            **linear_kwargs,
+        self.up_proj = FourOverSixLinear(
+            nn.Linear(
+                self.hidden_size,
+                self.intermediate_size,
+                bias=False,
+            ),
+            module_config,
         )
-        self.down_proj = TrainableFP4Linear(
-            self.intermediate_size,
-            self.hidden_size,
-            **linear_kwargs,
+        self.down_proj = FourOverSixLinear(
+            nn.Linear(
+                self.intermediate_size,
+                self.hidden_size,
+                bias=False,
+            ),
+            module_config,
         )
 
     def forward(
@@ -317,11 +328,17 @@ class FP4TransformerBlock(GradientCheckpointingLayer):
         self.config = config
         self.layer_idx = layer_idx
         self.precision_config = config.layer_precision_configs[layer_idx]
+        module_config = ModuleQuantizationConfig(
+            keep_master_weights=True,
+            weight_scale_2d=True,
+            **self.precision_config,
+        )
 
         self.attn_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(
-            config.hidden_size, eps=config.norm_eps,
+            config.hidden_size,
+            eps=config.norm_eps,
         )
-        self.attn = AttentionWithFP4Projections(
+        self.attn = AttentionWithQuantizedProjections(
             hidden_size=config.hidden_size,
             num_heads=config.num_heads,
             num_kv_heads=config.num_kv_heads,
@@ -331,21 +348,20 @@ class FP4TransformerBlock(GradientCheckpointingLayer):
             rope_theta=config.rope_theta,
             max_position_embeddings=config.max_position_embeddings,
             layer_idx=layer_idx,
-            scale_rule=self.precision_config["scale_rule"],
-            quantize_backend=self.precision_config.get("quantize_backend"),
+            module_config=module_config,
         )
 
         self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(
-            config.hidden_size, eps=config.norm_eps,
+            config.hidden_size,
+            eps=config.norm_eps,
         )
-        self.mlp = FP4GatedMLP(
+        self.mlp = QuantizedGatedMLP(
             hidden_size=config.hidden_size,
             hidden_ratio=config.hidden_ratio,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             fuse_swiglu=config.fuse_swiglu,
-            scale_rule=self.precision_config["scale_rule"],
-            quantize_backend=self.precision_config.get("quantize_backend"),
+            module_config=module_config,
         )
 
     def forward(
@@ -413,9 +429,10 @@ class FP4TransformerModel(FP4TransformerPreTrainedModel, TransformerModel):
                 (
                     FP4TransformerBlock
                     if config.layer_precision_configs[layer_idx].get(
-                        "precision", "bf16",
+                        "dtype",
+                        "bf16",
                     )
-                    == "fp4"
+                    != "bf16"
                     else TransformerBlock
                 )(config, layer_idx)
                 for layer_idx in range(config.num_hidden_layers)
